@@ -218,13 +218,15 @@ export interface HarnessAgentOptions extends Omit<
    * `search_memory` and `skills`); defaults to `undefined` (off). Accepts one command (`'npm test'`),
    * an array run in order, `'auto'` to detect one from the project files (`package.json` with a `test`
    * script, `pyproject.toml`, `Cargo.toml`, `go.mod`, a `Makefile` with a `test` target), or
-   * `{ commands, maxAttempts: 3, timeout: 600 }`. Checks run through the agent's `sandbox`. When one
-   * exits non-zero, its output goes back to the agent, which keeps working; after `maxAttempts` failed
-   * checks it gets one final turn to report what still fails. The outcome is written to
-   * `agent.appState` under `verification`. A `subagent` child never verifies; the parent does. `'auto'`
-   * runs project-defined scripts outside any approval gate, so it cannot be combined with
-   * `interventions`; name the commands explicitly instead. It cannot be combined with a `GoalLoop` in
-   * `plugins` either, since both drive the same resume.
+   * `{ commands, maxAttempts: 3, timeout: 600 }`. Sugar over `GoalLoop`: it adds a `Verification` plugin, a
+   * GoalLoop whose goal is the checks passing. Checks run through the agent's `sandbox`. When one exits non-zero,
+   * its output goes back to the agent, which keeps working; after `maxAttempts` failed check runs the loop stops
+   * and returns the agent's last answer, unverified, with a warning. An invocation stopped early (interrupt,
+   * cancel, `maxTokens`, limit) runs no checks; its changes are `'pending'` until a later invocation ends
+   * normally, and `maxAttempts` counts across such stops. The outcome is written to `agent.appState` under
+   * `verification`. A `subagent` child never verifies; the parent does. `'auto'` runs project-defined scripts
+   * outside any approval gate, so it cannot be combined with `interventions`; name the commands explicitly
+   * instead. It cannot be combined with another `GoalLoop` in `plugins` either, since an agent runs only one.
    */
   verify?: VerifyOption
 }
@@ -268,10 +270,10 @@ function verificationPlugin(
     return null
   }
   if (consumerPlugins.some((p) => p instanceof GoalLoop)) {
-    throw new Error('verify cannot be combined with a GoalLoop in plugins: both drive the same resume.')
-  }
-  if (consumerPlugins.some((p) => p instanceof Verification)) {
-    throw new Error('verify is set and plugins already contains a Verification; pass one or the other.')
+    throw new Error(
+      'verify cannot be combined with a GoalLoop in plugins (a Verification is one): verify builds a GoalLoop, ' +
+        'and an agent runs only one.'
+    )
   }
   const hasInterventions = Array.isArray(interventions) ? interventions.length > 0 : Boolean(interventions)
   if (config.commands === 'auto' && hasInterventions) {

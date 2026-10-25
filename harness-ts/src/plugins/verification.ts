@@ -1,30 +1,35 @@
 /**
  * Verification: run the project's own checks before the agent may report a change as done.
  *
- * When an invocation ends normally and the agent called a tool that can change the workspace, the
- * plugin runs each check command through the agent's `sandbox` (the seam the `shell` tool uses, so a
- * Docker or SSH sandbox runs the checks where the files live). If every check exits `0` the answer
- * stands. If one fails, its exit code and the tail of its output are fed back as a user message through
- * `AfterInvocationEvent.resume` and the agent keeps working. When the attempt budget is spent the agent
- * gets one last turn to tell the user what still fails, so a run never ends on an unverified "done".
+ * `Verification` is a `GoalLoop` whose goal is "the project's checks pass". When an invocation that changed the
+ * workspace ends normally (end of turn, stop sequence, `AfterToolsEvent.endTurn`, or structured output), the validator
+ * runs each check through `agent.sandbox`. A failing check's exit code and output tail become the GoalLoop feedback,
+ * so the agent keeps working. After `maxAttempts` failed check runs the last answer is returned unverified, with a
+ * warning. The outcome is written to `agent.appState` under `verification`.
  *
- * The outcome of the latest verification is written to `agent.appState` under `verification`.
+ * An invocation that stops early (interrupt, cancel, `maxTokens`, limit) runs no checks: its changes are carried to
+ * the next invocation and recorded as `pending`, and their attempt count carries with them.
  *
- * Checks are plain commands, never model calls. An invocation that only read, searched or planned (see
- * `READ_ONLY_TOOLS`) runs no checks. One that ends any other way than a normal end of turn (an
- * interrupt for approval, a cancellation, a limit) runs none either, but keeps its run open, so the
- * changes it made are verified when a later invocation on the agent finishes normally.
+ * A validator sees only the last message, so read-only hooks record what it cannot: which tools ran and how the
+ * invocation ended. A validator cannot say "not graded" either, so it passes an invocation it does not grade, and
+ * `lastResult` reports Verification's own outcome instead of GoalLoop's.
  */
 
 import {
   AfterInvocationEvent,
   AfterModelCallEvent,
   AfterToolCallEvent,
-  BeforeInvocationEvent,
+  AfterToolsEvent,
+  HookOrder,
   SandboxTimeoutError,
   type LocalAgent,
-  type Plugin,
 } from '@strands-agents/sdk'
+import {
+  GoalLoop,
+  type GoalAttempt,
+  type GoalResult,
+  type ValidationOutcome,
+} from '@strands-agents/sdk/vended-plugins/goal'
 import { logger } from '../logging.js'
 
 const DEFAULT_NAME = 'strands:verification'
@@ -39,9 +44,16 @@ const OUTPUT_TAIL_CHARS = 4_000
 // a possible change, so an unknown tool errs toward running the checks.
 const READ_ONLY_TOOLS = new Set(['read', 'web_fetch', 'web_search', 'todo_write', 'search_memory', 'skills'])
 
-// `'auto'` detection, first match wins: [file, text the file must contain, command].
+// Model stop reasons that end an invocation normally, so its changes are graded.
+const NORMAL_STOPS = new Set(['endTurn', 'stopSequence'])
+
+// The SDK's `STRUCTURED_OUTPUT_TOOL_NAME` (`tools/structured-output-tool.ts`), which its package does not export.
+const STRUCTURED_OUTPUT_TOOL = 'strands_structured_output'
+
+// `'auto'` detection, first match wins: [file, text the file must contain, command]. `package.json` is checked by
+// parsing it instead (see `hasNpmTest`).
 const AUTO_CHECKS: ReadonlyArray<readonly [string, string, string]> = [
-  ['package.json', '"test"', 'npm test'],
+  ['package.json', '', 'npm test'],
   ['pyproject.toml', '', 'python -m pytest -q'],
   ['Cargo.toml', '', 'cargo test'],
   ['go.mod', '', 'go test ./...'],
@@ -49,12 +61,12 @@ const AUTO_CHECKS: ReadonlyArray<readonly [string, string, string]> = [
 ]
 
 /** What the latest verification on an agent concluded. */
-export type VerificationStatus = 'passed' | 'failed' | 'noChecks'
+export type VerificationStatus = 'passed' | 'failed' | 'noChecks' | 'pending'
 
 /** The record written to `agent.appState.verification`. */
 export interface VerificationRecord {
   status: VerificationStatus
-  /** How many times the checks ran in the invocation. */
+  /** How many times the checks ran in the request. */
   attempts: number
   /** The last result of each check; `exitCode` is `null` when the command timed out. */
   checks: Array<{ command: string; exitCode: number | null }>
@@ -64,11 +76,14 @@ export interface VerificationRecord {
 export interface VerificationConfig {
   /** Shell commands to run in order, or `'auto'` to detect one from the project files. */
   commands: string[] | 'auto'
-  /** How many failed verifications the agent may try to fix before it must report. Defaults to 3. */
+  /**
+   * Most times the checks run in one request; every failure before the last sends the agent back to fix it.
+   * Defaults to 3.
+   */
   maxAttempts?: number
   /** Seconds each command may run; a command that runs longer counts as failed. Defaults to 600. */
   timeout?: number
-  /** Plugin name, for logging and duplicate detection. Defaults to `'strands:verification'`. */
+  /** Plugin name, for logging. Defaults to `'strands:verification'`. */
   name?: string
 }
 
@@ -78,17 +93,19 @@ interface CheckResult {
   output: string
 }
 
+/**
+ * One request: a set of changes from the first edit until an invocation ends normally and they are graded. It spans
+ * GoalLoop's retries and any invocation that stopped early (interrupt, cancel, `maxTokens`, limit).
+ */
 interface Run {
   changed: boolean
-  attempts: number
-  reporting: boolean
-  carryOver: boolean
+  /** A change landed after the last check run: the record no longer describes the workspace. */
+  dirty: boolean
   endedTurn: boolean
+  attempts: number
+  failed: boolean
   last: CheckResult[]
-}
-
-function newRun(): Run {
-  return { changed: false, attempts: 0, reporting: false, carryOver: false, endedTurn: false, last: [] }
+  history: GoalAttempt[]
 }
 
 function tail(text: string): string {
@@ -112,13 +129,9 @@ function failurePrompt(failed: CheckResult[], attempt: number, maxAttempts: numb
   )
 }
 
-function reportPrompt(failed: CheckResult[], maxAttempts: number): string {
-  const commands = failed.map((check) => `- ${check.command}`).join('\n')
-  return (
-    `<verification>\nThe project's checks still fail after ${maxAttempts} attempts:\n${commands}\n\n` +
-    'Stop changing files. Tell the user plainly that the task is not verified, which checks still fail, ' +
-    'and what you believe is wrong.\n</verification>'
-  )
+// The feedback is already the whole retry message; GoalLoop's default wording asks for a rewritten answer.
+function retryPrompt(feedback: string | undefined): string {
+  return feedback ?? "<verification>\nThe project's checks failed. Fix the cause and make them pass.\n</verification>"
 }
 
 async function readText(agent: LocalAgent, path: string): Promise<string | undefined> {
@@ -133,11 +146,25 @@ async function readText(agent: LocalAgent, path: string): Promise<string | undef
 export async function detectChecks(agent: LocalAgent): Promise<string[]> {
   for (const [path, marker, command] of AUTO_CHECKS) {
     const text = await readText(agent, path)
-    if (text !== undefined && text.includes(marker)) {
-      return [command]
+    if (text === undefined || !text.includes(marker)) {
+      continue
     }
+    if (path === 'package.json' && !hasNpmTest(text)) {
+      continue
+    }
+    return [command]
   }
   return []
+}
+
+/** Whether a `package.json` defines a non-empty `scripts.test`; malformed JSON counts as no. */
+function hasNpmTest(text: string): boolean {
+  try {
+    const test = (JSON.parse(text) as { scripts?: { test?: unknown } } | null)?.scripts?.test
+    return typeof test === 'string' && test.trim() !== ''
+  } catch {
+    return false
+  }
 }
 
 function isCommandList(commands: unknown): commands is string[] {
@@ -149,18 +176,17 @@ function isCommandList(commands: unknown): commands is string[] {
 }
 
 /**
- * Runs the project's checks when the agent finishes an invocation that changed the workspace.
- *
- * Only one plugin may drive `AfterInvocationEvent.resume` on an agent, so this plugin cannot be
- * combined with a `GoalLoop`. Sharing one instance across agents is safe: run state is per agent.
+ * The checks and the per-agent request state behind a {@link Verification}. A separate object because the
+ * GoalLoop validator is passed to `super()`, before a derived constructor may touch `this`.
  */
-export class Verification implements Plugin {
+class ChangeChecks {
   readonly name: string
   readonly commands: string[] | 'auto'
-  private readonly _maxAttempts: number
+  readonly maxAttempts: number
   private readonly _timeout: number
-  private readonly _runs = new WeakMap<LocalAgent, Run>()
-  private readonly _detected = new WeakMap<LocalAgent, string[]>()
+  private readonly _requests = new WeakMap<LocalAgent, Run>()
+  private readonly _results = new WeakMap<LocalAgent, GoalResult>()
+  private readonly _warnedNoChecks = new WeakSet<LocalAgent>()
 
   constructor(config: VerificationConfig) {
     const { commands, maxAttempts = DEFAULT_VERIFY_MAX_ATTEMPTS, timeout = DEFAULT_VERIFY_TIMEOUT } = config
@@ -177,98 +203,154 @@ export class Verification implements Plugin {
     }
     this.name = config.name ?? DEFAULT_NAME
     this.commands = commands === 'auto' ? 'auto' : [...commands]
-    this._maxAttempts = maxAttempts
+    this.maxAttempts = maxAttempts
     this._timeout = timeout
   }
 
-  initAgent(agent: LocalAgent): void {
-    agent.addHook(BeforeInvocationEvent, (event) => this._beforeInvocation(event.agent))
-    agent.addHook(AfterModelCallEvent, (event) => this._afterModelCall(event))
-    agent.addHook(AfterToolCallEvent, (event) => this._afterToolCall(event))
-    agent.addHook(AfterInvocationEvent, async (event) => this._afterInvocation(event))
+  observe(agent: LocalAgent, goalResult: (agent: LocalAgent) => GoalResult | undefined): void {
+    agent.addHook(AfterModelCallEvent, (event) => {
+      const stopReason = event.stopData?.stopReason
+      this._run(event.agent).endedTurn = stopReason !== undefined && NORMAL_STOPS.has(stopReason)
+    })
+    agent.addHook(AfterToolCallEvent, (event) => {
+      if (event.toolUse.name === STRUCTURED_OUTPUT_TOOL) {
+        // The structured-output tool records the answer; it changes nothing. Its success ends the invocation.
+        if (event.error === undefined && event.result.status === 'success') {
+          this._run(event.agent).endedTurn = true
+        }
+        return
+      }
+      if (!READ_ONLY_TOOLS.has(event.toolUse.name)) {
+        const run = this._run(event.agent)
+        run.changed = true
+        run.dirty = true
+      }
+    })
+    // SDK_LAST: runs after every default-order hook, so it reads the final `endTurn` whoever set it.
+    agent.addHook(
+      AfterToolsEvent,
+      (event) => {
+        if (event.endTurn) {
+          this._run(event.agent).endedTurn = true
+        }
+      },
+      { order: HookOrder.SDK_LAST }
+    )
+    agent.addHook(AfterInvocationEvent, (event) => this._afterInvocation(event, goalResult))
   }
 
-  private _beforeInvocation(agent: LocalAgent): void {
-    const run = this._runs.get(agent)
-    if (run?.carryOver) {
-      run.carryOver = false
-      run.endedTurn = false
-      return
+  /** Verification's own outcome; `undefined` while changes are unverified, `null` when no check ran. */
+  result(agent: LocalAgent): GoalResult | undefined | null {
+    if (this._requests.has(agent)) {
+      return undefined
     }
-    this._runs.set(agent, newRun())
+    return this._results.get(agent) ?? null
   }
 
-  // The TS AfterInvocationEvent carries no result, so a normal end of turn is read off the last model call.
-  private _afterModelCall(event: AfterModelCallEvent): void {
-    const run = this._runs.get(event.agent)
-    if (run) {
-      run.endedTurn = event.stopData?.stopReason === 'endTurn'
-    }
-  }
-
-  private _afterToolCall(event: AfterToolCallEvent): void {
-    const run = this._runs.get(event.agent)
-    if (run && !READ_ONLY_TOOLS.has(event.toolUse.name)) {
-      run.changed = true
-    }
-  }
-
-  private async _afterInvocation(event: AfterInvocationEvent): Promise<void> {
-    const agent = event.agent
-    const run = this._runs.get(agent)
-    if (!run) {
-      return
-    }
-    if (!run.endedTurn) {
-      run.carryOver = true
-      return
-    }
-    if (run.reporting) {
-      this._record(agent, 'failed', run)
-      return
-    }
-    if (!run.changed) {
-      return
+  /** The GoalLoop validator: pass unless a finished invocation changed the workspace and a check fails. */
+  async verify(agent: LocalAgent): Promise<boolean | ValidationOutcome> {
+    const run = this._requests.get(agent)
+    // Nothing to grade when the invocation stopped early (its changes are checked once a later one finishes) or
+    // changed nothing. Passing is also what keeps GoalLoop from resuming a run paused for approval.
+    if (!run?.endedTurn || !run.changed) {
+      return true
     }
 
-    const commands = await this._resolveCommands(agent)
-    if (commands.length === 0) {
-      this._record(agent, 'noChecks', run)
-      return
+    let commands: string[] | undefined
+    try {
+      commands = await this._resolveCommands(agent)
+    } catch (error) {
+      // A custom sandbox's readText may throw anything; never let it read as a pass.
+      run.last = [
+        { command: 'verify', exitCode: -1, output: `could not resolve the checks: ${(error as Error).message}` },
+      ]
+    }
+    if (commands !== undefined) {
+      if (commands.length === 0) {
+        run.dirty = false
+        this._record(agent, 'noChecks', run)
+        return true
+      }
+      run.last = []
+      for (const command of commands) {
+        run.last.push(await this._runCheck(agent, command))
+      }
     }
 
     run.attempts += 1
-    run.last = []
-    for (const command of commands) {
-      run.last.push(await this._runCheck(agent, command))
-    }
+    run.dirty = false
     const failed = run.last.filter((check) => check.exitCode !== 0)
-    if (failed.length === 0) {
-      this._record(agent, 'passed', run)
+    run.failed = failed.length > 0
+    const feedback = run.failed ? failurePrompt(failed, run.attempts, this.maxAttempts) : undefined
+    run.history.push({ attempt: run.attempts, passed: !run.failed, ...(feedback !== undefined && { feedback }) })
+    this._record(agent, run.failed ? 'failed' : 'passed', run)
+    if (!run.failed) {
+      return true
+    }
+    logger.debug(`plugin=<${this.name}>, attempt=<${run.attempts}>, failed=<${failed.length}> | checks failed`)
+    if (run.attempts >= this.maxAttempts) {
+      // Out of attempts. Passing is the only answer that stops GoalLoop: after an interrupt its own count restarted,
+      // so a failure would arm another retry. `lastResult` reports the failure instead.
+      return true
+    }
+    return { passed: false, feedback: feedback! }
+  }
+
+  private _run(agent: LocalAgent): Run {
+    let run = this._requests.get(agent)
+    if (run === undefined) {
+      run = { changed: false, dirty: false, endedTurn: false, attempts: 0, failed: false, last: [], history: [] }
+      this._requests.set(agent, run)
+    }
+    return run
+  }
+
+  private _afterInvocation(
+    event: AfterInvocationEvent,
+    goalResult: (agent: LocalAgent) => GoalResult | undefined
+  ): void {
+    const run = this._requests.get(event.agent)
+    if (run === undefined) {
       return
     }
-
-    logger.debug(`plugin=<${this.name}>, attempt=<${run.attempts}>, failed=<${failed.length}> | checks failed`)
-    if (run.attempts < this._maxAttempts) {
-      event.resume = failurePrompt(failed, run.attempts, this._maxAttempts)
-    } else {
-      run.reporting = true
-      event.resume = reportPrompt(failed, this._maxAttempts)
+    const endedTurn = run.endedTurn
+    run.endedTurn = false
+    if (event.resume !== undefined) {
+      return // GoalLoop retries after a failed check: the same request continues
     }
-    run.carryOver = true
+    if (run.dirty || (run.changed && !endedTurn)) {
+      // Stopped early (or GoalLoop never graded the pass): carry the changes, attempts included, to the next
+      // invocation. The request is unfinished, so the record says so: `pending` exactly while `lastResult` is
+      // `undefined`.
+      this._record(event.agent, 'pending', run)
+      return
+    }
+    this._requests.delete(event.agent)
+    if (run.history.length === 0) {
+      this._results.delete(event.agent)
+      return
+    }
+    if (!run.failed) {
+      this._results.set(event.agent, { passed: true, stopReason: 'satisfied', attempts: run.history })
+      return
+    }
+    const goal = goalResult(event.agent)
+    const stopReason = goal !== undefined && goal.stopReason !== 'satisfied' ? goal.stopReason : 'maxAttempts'
+    this._results.set(event.agent, { passed: false, stopReason, attempts: run.history })
+    logger.warn(
+      `plugin=<${this.name}>, attempts=<${run.attempts}> | checks still fail, returning the answer unverified`
+    )
   }
 
   private async _resolveCommands(agent: LocalAgent): Promise<string[]> {
     if (this.commands !== 'auto') {
       return this.commands
     }
-    let detected = this._detected.get(agent)
-    if (detected === undefined) {
-      detected = await detectChecks(agent)
-      if (detected.length === 0) {
-        logger.warn(`plugin=<${this.name}> | verify='auto' found no test command, no checks will run`)
-      }
-      this._detected.set(agent, detected)
+    // Detected on every graded run, not cached: an agent that scaffolds a project later gets its checks.
+    const detected = await detectChecks(agent)
+    if (detected.length === 0 && !this._warnedNoChecks.has(agent)) {
+      this._warnedNoChecks.add(agent)
+      logger.warn(`plugin=<${this.name}> | verify='auto' found no test command, no checks will run`)
     }
     return detected
   }
@@ -293,5 +375,45 @@ export class Verification implements Plugin {
       checks: run.last.map((check) => ({ command: check.command, exitCode: check.exitCode })),
     }
     agent.appState.set(VERIFICATION_STATE_KEY, record)
+  }
+}
+
+/**
+ * A `GoalLoop` whose goal is the project's checks passing after the agent changed the workspace.
+ *
+ * Only one GoalLoop may drive an agent, so this plugin cannot be combined with another one. Sharing one instance
+ * across agents is safe: run state is per agent.
+ */
+export class Verification extends GoalLoop {
+  readonly commands: string[] | 'auto'
+  private readonly _checks: ChangeChecks
+
+  constructor(config: VerificationConfig) {
+    const checks = new ChangeChecks(config)
+    super({
+      goal: (_response, agent) => checks.verify(agent),
+      maxAttempts: checks.maxAttempts,
+      name: checks.name,
+      resumePromptTemplate: retryPrompt,
+    })
+    this._checks = checks
+    this.commands = checks.commands
+  }
+
+  /**
+   * Outcome of the latest finished request on `agent`, from Verification's own check runs. `undefined` while changes
+   * are still unverified (a request in flight, or one carried over after an early stop). A request that ran no check
+   * falls back to GoalLoop's result.
+   */
+  override lastResult(agent: LocalAgent): GoalResult | undefined {
+    const result = this._checks.result(agent)
+    return result === null ? super.lastResult(agent) : result
+  }
+
+  override initAgent(agent: LocalAgent): void {
+    // Registered before GoalLoop's on purpose: After* callbacks run in reverse registration order, so the
+    // AfterInvocationEvent observer runs after GoalLoop's and sees whether it armed a retry.
+    this._checks.observe(agent, (a) => super.lastResult(a))
+    super.initAgent(agent)
   }
 }

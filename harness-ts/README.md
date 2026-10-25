@@ -518,19 +518,25 @@ createHarness({ verify: 'auto' }) // detect one from the project files
 createHarness({ verify: { commands: ['npm test'], maxAttempts: 3, timeout: 600 } })
 ```
 
-If every command exits `0`, the answer is returned as usual. If one fails, its exit code and the end
-of its output go back to the agent, which keeps working. After `maxAttempts` failed checks (3 by
-default) the agent gets one last turn to tell you what still fails, so it can't end on an unchecked
-"done". The outcome is saved in `agent.appState` under `verification` (`status` is `'passed'`,
-`'failed'` or `'noChecks'`), so a script or CI job can read it.
+`verify` is sugar over [`GoalLoop`](https://strandsagents.com/docs/user-guide/sdk/plugins/goal-loop/):
+it adds a `Verification` plugin, a GoalLoop whose goal is your checks passing. If every command exits
+`0`, the answer is returned as usual. If one fails, its exit code and the end of its output go back to
+the agent, which keeps working. After `maxAttempts` failed check runs (3 by default) the loop stops and
+returns the agent's last answer, unverified, with a warning in the log. The outcome is in `agent.appState`
+under `verification`: `status` is `'passed'`, `'failed'`, `'noChecks'` or `'pending'`, so treat anything but
+`'passed'` as unverified.
+
+An invocation stopped early (an approval interrupt, a cancellation, `maxTokens`, a limit) runs no checks.
+Its changes are `'pending'` until a later invocation ends normally, and `maxAttempts` keeps counting across
+such stops.
 
 A request that only read files, searched or planned runs no checks. Checks run in the agent's
 `sandbox`, a timed-out command counts as a failure, and a `subagent` child never runs them itself.
 `'auto'` picks `npm test` (a `package.json` with a `test` script), `python -m pytest -q`
 (`pyproject.toml`), `cargo test`, `go test ./...` or `make test`, and warns when it finds none.
 Because detected commands run project-defined scripts outside any approval gate, `'auto'` can't be
-combined with `interventions`; name the commands instead. `verify` can't be combined with a
-`GoalLoop` plugin either, since both drive the same retry.
+combined with `interventions`; name the commands instead. `verify` can't be combined with another
+`GoalLoop` plugin either, since an agent runs only one.
 
 ## It's just a Strands Agent
 

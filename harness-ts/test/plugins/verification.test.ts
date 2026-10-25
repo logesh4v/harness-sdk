@@ -3,7 +3,9 @@ import { readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { z } from 'zod'
 import {
+  AfterToolsEvent,
   BeforeToolCallEvent,
   Model,
   Sandbox,
@@ -24,9 +26,11 @@ import { configureLogging } from '../../src/logging.js'
 import { Verification, detectChecks } from '../../src/plugins/verification.js'
 
 type ToolCall = [name: string, input: Record<string, unknown>]
-type Turn = string | ToolCall[]
+/** A text turn that ends with `reason` instead of `endTurn`. */
+type Stop = { text: string; reason: 'stopSequence' | 'maxTokens' }
+type Turn = string | Stop | ToolCall[]
 
-/** Replays assistant turns in order; each turn is a text reply or a list of tool calls. */
+/** Replays assistant turns in order: a text reply, a list of tool calls, or a {@link Stop}. */
 class ScriptedModel extends Model<BaseModelConfig> {
   readonly prompts: string[] = []
   private readonly _turns: Turn[]
@@ -49,11 +53,12 @@ class ScriptedModel extends Model<BaseModelConfig> {
     const turn = this._turns.shift()
     if (turn === undefined) throw new Error('All turns have been consumed')
     yield { type: 'modelMessageStartEvent', role: 'assistant' }
-    if (typeof turn === 'string') {
+    if (!Array.isArray(turn)) {
+      const { text, reason } = typeof turn === 'string' ? { text: turn, reason: 'endTurn' as const } : turn
       yield { type: 'modelContentBlockStartEvent' }
-      yield { type: 'modelContentBlockDeltaEvent', delta: { type: 'textDelta', text: turn } }
+      yield { type: 'modelContentBlockDeltaEvent', delta: { type: 'textDelta', text } }
       yield { type: 'modelContentBlockStopEvent' }
-      yield { type: 'modelMessageStopEvent', stopReason: 'endTurn' }
+      yield { type: 'modelMessageStopEvent', stopReason: reason }
       return
     }
     for (const [index, [name, input]] of turn.entries()) {
@@ -163,6 +168,24 @@ function verificationOf(agent: Agent): Verification | undefined {
   return plugins(agent).find((p): p is Verification => p instanceof Verification)
 }
 
+function outcome(agent: Agent): [boolean, string, boolean[]] | undefined {
+  const result = verificationOf(agent)!.lastResult(agent)
+  return result && [result.passed, result.stopReason, result.attempts.map((a) => a.passed)]
+}
+
+function read(): ToolCall[] {
+  return [['read', { path: join(dir, 'out.txt') }]]
+}
+
+function gateRead(agent: Agent): void {
+  agent.addHook(BeforeToolCallEvent, (event) => {
+    if (event.toolUse.name === 'read') event.interrupt({ name: 'approve-read', reason: 'read?' })
+  })
+}
+
+const SO = 'strands_structured_output'
+const schema = z.object({ summary: z.string() })
+
 describe('verify', () => {
   it('is off by default', async () => {
     expect(verificationOf(await harness(new ScriptedModel([])))).toBeUndefined()
@@ -200,20 +223,60 @@ describe('verify', () => {
     expect(agent.appState.get('verification')).toMatchObject({ status: 'passed', attempts: 2 })
   })
 
-  it('forces a final report turn once the attempts are spent', async () => {
-    const model = new ScriptedModel([write(), 'Done.', write(), 'Done again.', 'The tests still fail.'])
+  it('returns the last answer unverified once the attempts are spent', async () => {
+    const warn = vi.fn()
+    configureLogging({ debug: () => {}, info: () => {}, warn, error: () => {} })
+    try {
+      const model = new ScriptedModel([write(), 'Done.', write(), 'Done again.'])
+      const sandbox = new ScriptedSandbox([1, 1])
+      const agent = await harness(model, { sandbox, verify: { commands: ['npm test'], maxAttempts: 2 } })
+
+      const result = await agent.invoke('make it')
+
+      // GoalLoop stops after maxAttempts failed checks; there is no extra report turn.
+      expect(result.toString().trim()).toBe('Done again.')
+      expect(sandbox.commands).toEqual(['npm test', 'npm test'])
+      expect(agent.appState.get('verification')).toEqual({
+        status: 'failed',
+        attempts: 2,
+        checks: [{ command: 'npm test', exitCode: 1 }],
+      })
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('returning the answer unverified'))
+    } finally {
+      configureLogging({ debug: () => {}, info: () => {}, warn: console.warn, error: console.error })
+    }
+  })
+
+  it('still runs the checks when a retry changes nothing', async () => {
+    // The retry changes nothing; its "done" must still be checked against the failing workspace.
     const sandbox = new ScriptedSandbox([1, 1])
-    const agent = await harness(model, { sandbox, verify: { commands: ['npm test'], maxAttempts: 2 } })
+    const agent = await harness(new ScriptedModel([write(), 'Done.', 'Fixed, trust me.']), {
+      sandbox,
+      verify: { commands: ['t'], maxAttempts: 2 },
+    })
 
-    const result = await agent.invoke('make it')
+    await agent.invoke('make it')
 
-    expect(result.toString().trim()).toBe('The tests still fail.')
-    expect(model.prompts.at(-1)).toContain('Stop changing files')
-    expect(sandbox.commands).toEqual(['npm test', 'npm test'])
-    expect(agent.appState.get('verification')).toEqual({
-      status: 'failed',
-      attempts: 2,
-      checks: [{ command: 'npm test', exitCode: 1 }],
+    expect(sandbox.commands).toEqual(['t', 't'])
+    expect(agent.appState.get('verification')).toMatchObject({ status: 'failed' })
+  })
+
+  it('is a GoalLoop', async () => {
+    const model = new ScriptedModel([write(), 'Done.', write(), 'Done again.', write(), 'Fixed.'])
+    const agent = await harness(model, {
+      sandbox: new ScriptedSandbox([1, 1, 0]),
+      verify: { commands: ['t'], maxAttempts: 2 },
+    })
+    const plugin = verificationOf(agent)!
+
+    expect(plugin).toBeInstanceOf(GoalLoop)
+    await agent.invoke('make it')
+    expect(plugin.lastResult(agent)?.stopReason).toBe('maxAttempts')
+    await agent.invoke('try again') // a new request starts a new GoalLoop run
+    expect(plugin.lastResult(agent)).toMatchObject({
+      passed: true,
+      stopReason: 'satisfied',
+      attempts: [{ attempt: 1 }],
     })
   })
 
@@ -265,7 +328,7 @@ describe('verify', () => {
         throw new SandboxTimeoutError('timed out')
       }
     }
-    const agent = await harness(new ScriptedModel([write(), 'Done.', 'It hangs.']), {
+    const agent = await harness(new ScriptedModel([write(), 'Done.']), {
       sandbox: new SlowSandbox(),
       verify: { commands: ['slow'], maxAttempts: 1, timeout: 0.5 },
     })
@@ -285,7 +348,7 @@ describe('verify', () => {
         throw new Error('container is gone')
       }
     }
-    const agent = await harness(new ScriptedModel([write(), 'Done.', 'Report.']), {
+    const agent = await harness(new ScriptedModel([write(), 'Done.']), {
       sandbox: new BrokenSandbox(),
       verify: { commands: ['t'], maxAttempts: 1 },
     })
@@ -326,6 +389,9 @@ describe("verify: 'auto'", () => {
     ['go.mod', 'module x\n', ['go test ./...']],
     ['Makefile', 'build:\n\ttrue\ntest:\n\ttrue\n', ['make test']],
     ['package.json', '{"scripts": {"build": "tsc"}}', []],
+    ['package.json', '{"description": "a \\"test\\" helper", "devDependencies": {"test": "1"}}', []],
+    ['package.json', '{"scripts": {"test": ""}}', []],
+    ['package.json', '{"scripts": {"test": "vitest"', []],
     ['Makefile', 'build:\n\ttrue\n', []],
   ])('detects %s', async (path, content, expected) => {
     writeFileSync(join(dir, path), content)
@@ -349,6 +415,28 @@ describe("verify: 'auto'", () => {
       expect(sandbox.commands).toEqual([])
       expect(agent.appState.get('verification')).toEqual({ status: 'noChecks', attempts: 0, checks: [] })
       expect(warn).toHaveBeenCalledWith(expect.stringContaining('found no test command'))
+    } finally {
+      configureLogging({ debug: () => {}, info: () => {}, warn: console.warn, error: console.error })
+    }
+  })
+
+  it('gives a project scaffolded later its checks', async () => {
+    const warn = vi.fn()
+    configureLogging({ debug: () => {}, info: () => {}, warn, error: () => {} })
+    try {
+      const model = new ScriptedModel([write('notes.md'), 'Noted.', write(), 'Changed.', write(), 'Changed again.'])
+      const sandbox = new ScriptedSandbox([0, 0])
+      const agent = await harness(model, { sandbox, verify: 'auto' })
+
+      await agent.invoke('write notes')
+      expect(agent.appState.get('verification')).toMatchObject({ status: 'noChecks' })
+      writeFileSync(join(dir, 'go.mod'), 'module x\n')
+      await agent.invoke('add a feature')
+      await agent.invoke('add another')
+
+      expect(sandbox.commands).toEqual(['go test ./...', 'go test ./...'])
+      expect(agent.appState.get('verification')).toMatchObject({ status: 'passed' })
+      expect(warn.mock.calls.filter(([m]) => String(m).includes('found no test command'))).toHaveLength(1)
     } finally {
       configureLogging({ debug: () => {}, info: () => {}, warn: console.warn, error: console.error })
     }
@@ -406,12 +494,185 @@ describe('verify option validation', () => {
   it('refuses a second Verification', async () => {
     const plugin = new Verification({ commands: ['t'] })
     await expect(harness(new ScriptedModel([]), { verify: 't', plugins: [plugin] })).rejects.toThrow(
-      'already contains a Verification'
+      'a Verification is one'
     )
   })
 
   it('accepts a Verification plugin on its own', async () => {
     const agent = await harness(new ScriptedModel([]), { plugins: [new Verification({ commands: ['t'] })] })
     expect(verificationOf(agent)).toBeDefined()
+  })
+})
+
+describe('verify: how an invocation ends', () => {
+  const so: ToolCall[] = [[SO, { summary: 'done' }]]
+  const endings = ['stopSequence', 'afterToolsEndTurn', 'structuredOutput', 'invalidThenValidOutput', 'outputWithWrite']
+
+  it.each(endings)('grades a %s ending', async (ending) => {
+    // Built per test: `write()` reads the per-test `dir`.
+    const turns = {
+      stopSequence: [write(), { text: 'Done.', reason: 'stopSequence' as const }],
+      afterToolsEndTurn: [write()],
+      structuredOutput: [write(), 'Done.', so],
+      invalidThenValidOutput: [write(), 'Done.', [[SO, { wrong: 1 }]] as ToolCall[], so],
+      outputWithWrite: [[...write(), ...so]],
+    }[ending] as Turn[]
+    const sandbox = new ScriptedSandbox([0])
+    const agent = await harness(new ScriptedModel(turns), { sandbox, verify: 't' })
+    if (ending === 'afterToolsEndTurn') {
+      agent.addHook(AfterToolsEvent, (event) => {
+        event.endTurn = 'Done.'
+      })
+    }
+
+    await agent.invoke('make it', /output/i.test(ending) ? { structuredOutputSchema: schema } : {})
+
+    expect(sandbox.commands).toEqual(['t'])
+    expect(agent.appState.get('verification')).toMatchObject({ status: 'passed' })
+    expect(outcome(agent)).toEqual([true, 'satisfied', [true]])
+  })
+
+  it('leaves nothing pending after a read-only structured-output request', async () => {
+    const sandbox = new ScriptedSandbox([])
+    const agent = await harness(new ScriptedModel(['Hi.', [[SO, { summary: 'hi' }]], 'Just answering.']), {
+      sandbox,
+      verify: 't',
+    })
+
+    await agent.invoke('say hi', { structuredOutputSchema: schema })
+    await agent.invoke('a question')
+
+    expect(sandbox.commands).toEqual([])
+    expect(agent.appState.get('verification')).toBeUndefined()
+  })
+
+  describe.each(['nothing', 'failedCheckThenWrite', 'failedCheckNoWrite'] as const)('before: %s', (before) => {
+    it.each(['interrupt', 'maxTokens'] as const)('a %s is pending and checked next time', async (early) => {
+      const turns: Turn[] =
+        before === 'nothing'
+          ? [write()]
+          : before === 'failedCheckThenWrite'
+            ? [write(), 'Done.', write()]
+            : [write(), 'Done.']
+      turns.push(early === 'interrupt' ? read() : { text: 'partial', reason: 'maxTokens' }, 'Fixed.')
+      const checksBefore = before === 'nothing' ? [] : ['t']
+      const sandbox = new ScriptedSandbox(checksBefore.length ? [1, 0] : [0])
+      const agent = await harness(new ScriptedModel(turns), { sandbox, verify: 't' })
+      gateRead(agent)
+
+      let stopped: Awaited<ReturnType<Agent['invoke']>> | undefined
+      if (early === 'maxTokens') {
+        await expect(agent.invoke('make it')).rejects.toThrow()
+      } else {
+        stopped = await agent.invoke('make it')
+      }
+
+      expect(sandbox.commands).toEqual(checksBefore)
+      expect(agent.appState.get('verification')).toMatchObject({ status: 'pending' })
+      expect(outcome(agent)).toBeUndefined()
+
+      const result =
+        stopped !== undefined
+          ? await agent.invoke([{ interruptResponse: { interruptId: stopped.interrupts[0]!.id, response: 'yes' } }])
+          : await agent.invoke('go on')
+      expect(result.toString().trim()).toBe('Fixed.')
+      expect(sandbox.commands).toEqual([...checksBefore, 't'])
+      expect(agent.appState.get('verification')).toEqual({
+        status: 'passed',
+        attempts: sandbox.commands.length,
+        checks: [{ command: 't', exitCode: 0 }],
+      })
+      expect(outcome(agent)).toEqual([true, 'satisfied', checksBefore.length ? [false, true] : [true]])
+    })
+  })
+
+  it('records pending, not passed, when a later change is interrupted', async () => {
+    const sandbox = new ScriptedSandbox([0])
+    const agent = await harness(new ScriptedModel([write(), 'Done.', write(), read()]), { sandbox, verify: 't' })
+    gateRead(agent)
+
+    await agent.invoke('make it')
+    await agent.invoke('change more')
+
+    expect(sandbox.commands).toEqual(['t'])
+    expect(agent.appState.get('verification')).toMatchObject({ status: 'pending' })
+    expect(outcome(agent)).toBeUndefined()
+  })
+
+  it('reports only what the last check said when a turn limit hits after a failed check', async () => {
+    const sandbox = new ScriptedSandbox([1, 0])
+    const agent = await harness(new ScriptedModel([write(), 'Done.', write(), write(), 'Fixed.']), {
+      sandbox,
+      verify: 't',
+    })
+
+    await agent.invoke('make it', { limits: { turns: 3 } })
+
+    // SDK versions differ on whether GoalLoop's retry may pass the limit; either way the outcome matches the last
+    // check, and 'pending' goes with no result.
+    const actual = JSON.stringify([(agent.appState.get('verification') as { status: string }).status, outcome(agent)])
+    const allowed =
+      sandbox.commands.length === 1
+        ? [JSON.stringify(['pending', undefined]), JSON.stringify(['failed', [false, 'limit', [false]]])]
+        : [JSON.stringify(['passed', [true, 'satisfied', [false, true]]])]
+    expect(allowed).toContain(actual)
+  })
+
+  it('keeps the attempt budget across interrupts', async () => {
+    const model = new ScriptedModel([write(), 'Done.', write(), 'Done.', write(), 'Done.', write(), 'Done.'])
+    const sandbox = new ScriptedSandbox([1, 1, 1, 1])
+    const agent = await harness(model, { sandbox, verify: { commands: ['t'], maxAttempts: 2 } })
+    agent.addHook(BeforeToolCallEvent, (event) => {
+      if (event.toolUse.name === 'write') event.interrupt({ name: 'approve-write', reason: 'write?' })
+    })
+
+    let result = await agent.invoke('make it')
+    for (let round = 0; result.stopReason === 'interrupt' && round < 4; round++) {
+      result = await agent.invoke([{ interruptResponse: { interruptId: result.interrupts[0]!.id, response: 'yes' } }])
+    }
+
+    expect(result.stopReason).toBe('endTurn')
+    expect(sandbox.commands).toEqual(['t', 't'])
+    const headers = model.prompts.filter((p) => p.includes('<verification>')).map((p) => p.split('\n')[1])
+    expect(headers).toEqual(["The project's checks failed after your changes (attempt 1 of 2)."])
+    expect(outcome(agent)).toEqual([false, 'maxAttempts', [false, false]])
+  })
+
+  it('has no lastResult mid-invocation and keeps it per agent', async () => {
+    const plugin = new Verification({ commands: ['t'] })
+    const seen: unknown[] = []
+    const first = await harness(new ScriptedModel([]), { sandbox: new ScriptedSandbox([]), plugins: [plugin] })
+    const second = await harness(new ScriptedModel([write(), 'Done.']), {
+      sandbox: new ScriptedSandbox([0]),
+      plugins: [plugin],
+    })
+    second.addHook(BeforeToolCallEvent, (event) => {
+      seen.push(plugin.lastResult(event.agent))
+    })
+
+    await second.invoke('make it')
+
+    expect(seen).toEqual([undefined])
+    expect(plugin.lastResult(second)?.passed).toBe(true)
+    expect(plugin.lastResult(first)).toBeUndefined()
+  })
+
+  it('records a validator error as a failure', async () => {
+    const agent = await harness(new ScriptedModel([write(), 'Done.']), {
+      sandbox: new ScriptedSandbox([]),
+      verify: { commands: ['t'], maxAttempts: 1 },
+    })
+    const checks = (verificationOf(agent) as unknown as { _checks: { _resolveCommands: () => Promise<string[]> } })
+      ._checks
+    checks._resolveCommands = async () => {
+      throw new Error('sandbox is gone')
+    }
+
+    await agent.invoke('make it')
+
+    expect((agent.appState.get('verification') as { checks: unknown }).checks).toEqual([
+      { command: 'verify', exitCode: -1 },
+    ])
+    expect(outcome(agent)).toEqual([false, 'maxAttempts', [false]])
   })
 })

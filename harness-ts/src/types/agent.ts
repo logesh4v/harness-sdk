@@ -100,7 +100,10 @@ export type ContextManagerOption = NonNullable<AgentConfig['contextManager']> | 
 export interface VerifyConfig {
   /** Shell commands run in order, or `'auto'` to detect one from the project files. */
   commands: string[] | 'auto'
-  /** Failed verifications the agent may try to fix before it must report. Defaults to 3. */
+  /**
+   * Most times the checks run in one request; every failure before the last sends the agent back to fix it.
+   * Defaults to 3.
+   */
   maxAttempts?: number
   /** Seconds each command may run; a command that runs longer counts as failed. Defaults to 600. */
   timeout?: number
