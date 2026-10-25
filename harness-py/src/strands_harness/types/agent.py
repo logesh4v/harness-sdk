@@ -171,7 +171,8 @@ class VerifyConfig(TypedDict, total=False):
 
     Attributes:
         commands: Shell commands run in order, or ``"auto"`` to detect one from the project files.
-        max_attempts: Failed verifications the agent may try to fix before it must report. Default 3.
+        max_attempts: Most times the checks run in one request; every failure before the last sends the agent
+            back to fix it. Default 3.
         timeout: Seconds each command may run; a command that runs longer counts as failed. Default 600.
     """
 

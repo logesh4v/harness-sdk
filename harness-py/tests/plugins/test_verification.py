@@ -3,10 +3,12 @@ import os
 import sys
 
 import pytest
-from strands.hooks import BeforeToolCallEvent
+from pydantic import BaseModel
+from strands.hooks import AfterToolsEvent, BeforeToolCallEvent
 from strands.models import Model
 from strands.sandbox import ExecutionResult
 from strands.sandbox.not_a_sandbox_local_environment import NotASandboxLocalEnvironment
+from strands.types.exceptions import MaxTokensReachedException
 from strands.vended_plugins.goal import GoalLoop
 
 from strands_harness import create_harness
@@ -15,7 +17,7 @@ from strands_harness.plugins.verification import detect_checks
 
 
 class _ScriptedModel(Model):
-    """Replays assistant turns in order; each turn is a text reply or a list of tool calls."""
+    """Replays assistant turns in order: a text reply, a list of tool calls, or ``_stop(reason, text)``."""
 
     def __init__(self, turns):
         self.turns = list(turns)
@@ -36,11 +38,12 @@ class _ScriptedModel(Model):
         self.prompts.extend(block["text"] for block in last if "text" in block)
         turn = self.turns.pop(0)
         yield {"messageStart": {"role": "assistant"}}
-        if isinstance(turn, str):
+        if isinstance(turn, (str, _Stop)):
+            reason, text = (turn.reason, turn.text) if isinstance(turn, _Stop) else ("end_turn", turn)
             yield {"contentBlockStart": {"start": {}}}
-            yield {"contentBlockDelta": {"delta": {"text": turn}}}
+            yield {"contentBlockDelta": {"delta": {"text": text}}}
             yield {"contentBlockStop": {}}
-            yield {"messageStop": {"stopReason": "end_turn"}}
+            yield {"messageStop": {"stopReason": reason}}
             return
         for index, (name, tool_input) in enumerate(turn):
             yield {
@@ -49,6 +52,13 @@ class _ScriptedModel(Model):
             yield {"contentBlockDelta": {"delta": {"toolUse": {"input": json.dumps(tool_input)}}}}
             yield {"contentBlockStop": {}}
         yield {"messageStop": {"stopReason": "tool_use"}}
+
+
+class _Stop:
+    """A text turn that ends with ``reason`` instead of ``end_turn``."""
+
+    def __init__(self, reason, text="partial"):
+        self.reason, self.text = reason, text
 
 
 class _ScriptedSandbox(NotASandboxLocalEnvironment):
@@ -91,6 +101,32 @@ def _in_tmp(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
 
 
+def _plugin(agent):
+    return next(p for p in agent._plugin_registry._plugins.values() if isinstance(p, Verification))
+
+
+def _outcome(agent):
+    result = _plugin(agent).last_result(agent)
+    return None if result is None else (result.passed, result.stop_reason, [a.passed for a in result.attempts])
+
+
+def _gate_read(event):
+    if event.tool_use["name"] == "read":
+        event.interrupt("approve-read", reason="read?")
+
+
+def _approve(agent, result):
+    return agent([{"interruptResponse": {"interruptId": result.interrupts[0].id, "response": "yes"}}])
+
+
+def _read():
+    return [("read", {"path": os.path.abspath("out.txt")})]
+
+
+class _Out(BaseModel):
+    summary: str
+
+
 def test_off_by_default():
     agent = _harness(_ScriptedModel([]))
     assert not any(isinstance(p, Verification) for p in agent._plugin_registry._plugins.values())
@@ -128,21 +164,48 @@ def test_failing_check_feeds_output_back_until_it_passes():
     assert agent.state.get("verification")["attempts"] == 2
 
 
-def test_exhausted_attempts_force_a_final_report_turn():
-    model = _ScriptedModel([_write(), "Done.", _write(), "Done again.", "The tests still fail."])
+def test_exhausted_attempts_return_the_last_answer_unverified(caplog):
+    model = _ScriptedModel([_write(), "Done.", _write(), "Done again."])
     sandbox = _ScriptedSandbox([1, 1])
     agent = _harness(model, sandbox, verify={"commands": ["pytest -q"], "max_attempts": 2})
 
     result = agent("make it")
 
-    assert str(result).strip() == "The tests still fail."
-    assert "Stop changing files" in model.prompts[-1]
+    # GoalLoop stops after max_attempts failed checks; there is no extra report turn.
+    assert str(result).strip() == "Done again."
+    assert model.turns == []
     assert sandbox.commands == ["pytest -q", "pytest -q"]
     assert agent.state.get("verification") == {
         "status": "failed",
         "attempts": 2,
         "checks": [{"command": "pytest -q", "exit_code": 1}],
     }
+    assert any("returning the answer unverified" in r.message for r in caplog.records)
+
+
+def test_retry_without_new_changes_still_runs_the_checks():
+    # The retry changes nothing; its "done" must still be checked against the failing workspace.
+    model = _ScriptedModel([_write(), "Done.", "Fixed, trust me."])
+    sandbox = _ScriptedSandbox([1, 1])
+    agent = _harness(model, sandbox, verify={"commands": ["t"], "max_attempts": 2})
+
+    agent("make it")
+
+    assert sandbox.commands == ["t", "t"]
+    assert agent.state.get("verification")["status"] == "failed"
+
+
+def test_verification_is_a_goal_loop():
+    model = _ScriptedModel([_write(), "Done.", _write(), "Done again.", _write(), "Fixed."])
+    agent = _harness(model, _ScriptedSandbox([1, 1, 0]), verify={"commands": ["t"], "max_attempts": 2})
+    plugin = next(p for p in agent._plugin_registry._plugins.values() if isinstance(p, Verification))
+
+    assert isinstance(plugin, GoalLoop)
+    agent("make it")
+    assert plugin.last_result(agent).stop_reason == "max_attempts"
+    agent("try again")  # a new request starts a new GoalLoop run
+    result = plugin.last_result(agent)
+    assert (result.passed, result.stop_reason, len(result.attempts)) == (True, "satisfied", 1)
 
 
 def test_read_only_invocation_runs_no_checks():
@@ -188,7 +251,7 @@ def test_changes_before_an_interrupt_are_verified_after_it():
 
 
 def test_timeout_counts_as_failure(tmp_path):
-    model = _ScriptedModel([_write(), "Done.", "It hangs."])
+    model = _ScriptedModel([_write(), "Done."])
     command = f'"{sys.executable}" -c "import time; time.sleep(5)"'
     agent = _harness(model, verify={"commands": [command], "max_attempts": 1, "timeout": 0.5})
 
@@ -231,7 +294,7 @@ def test_sandbox_error_counts_as_failure():
         async def execute(self, command, *, timeout=None, **kwargs):
             raise RuntimeError("container is gone")
 
-    model = _ScriptedModel([_write(), "Done.", "Report."])
+    model = _ScriptedModel([_write(), "Done."])
     agent = _harness(model, _Broken(), verify={"commands": ["t"], "max_attempts": 1})
 
     agent("make it")
@@ -249,6 +312,9 @@ class TestAuto:
             ("go.mod", "module x\n", ["go test ./..."]),
             ("Makefile", "build:\n\ttrue\ntest:\n\ttrue\n", ["make test"]),
             ("package.json", '{"scripts": {"build": "tsc"}}', []),
+            ("package.json", '{"description": "a \\"test\\" helper", "devDependencies": {"test": "1"}}', []),
+            ("package.json", '{"scripts": {"test": ""}}', []),
+            ("package.json", '{"scripts": {"test": "vitest"', []),
             ("Makefile", "build:\n\ttrue\n", []),
         ],
     )
@@ -270,6 +336,21 @@ class TestAuto:
         assert sandbox.commands == []
         assert agent.state.get("verification") == {"status": "no_checks", "attempts": 0, "checks": []}
         assert any("found no test command" in r.message for r in caplog.records)
+
+    def test_a_project_scaffolded_later_gets_its_checks(self, tmp_path, caplog):
+        model = _ScriptedModel([_write("notes.md"), "Noted.", _write(), "Changed.", _write(), "Changed again."])
+        sandbox = _ScriptedSandbox([0, 0])
+        agent = _harness(model, sandbox, verify="auto")
+
+        agent("write notes")
+        assert agent.state.get("verification")["status"] == "no_checks"
+        (tmp_path / "go.mod").write_text("module x\n")
+        agent("add a feature")
+        agent("add another")
+
+        assert sandbox.commands == ["go test ./...", "go test ./..."]
+        assert agent.state.get("verification")["status"] == "passed"
+        assert sum("found no test command" in r.message for r in caplog.records) == 1
 
     def test_detected_command_runs(self, tmp_path):
         (tmp_path / "go.mod").write_text("module x\n")
@@ -321,8 +402,8 @@ class TestOptionValidation:
         with pytest.raises(ValueError, match="GoalLoop"):
             _harness(_ScriptedModel([]), verify="t", plugins=[GoalLoop(goal=lambda r, a: True, max_attempts=1)])
 
-    def test_refuses_duplicate_plugin(self):
-        with pytest.raises(ValueError, match="already contains a Verification"):
+    def test_refuses_a_second_verification(self):
+        with pytest.raises(ValueError, match="a Verification is one"):
             _harness(_ScriptedModel([]), verify="t", plugins=[Verification(["t"])])
 
     def test_plugin_instance_alone_is_accepted(self):
@@ -343,3 +424,151 @@ def test_subagent_config_has_no_verify(monkeypatch):
     monkeypatch.setattr(agent_module, "build_default_subagent", spy)
     create_harness(model=_ScriptedModel([]), verify="pytest -q", session=False, memory=False, skills=False)
     assert seen and "verify" not in seen
+
+
+class TestHowAnInvocationEnds:
+    @pytest.mark.parametrize(
+        "ending",
+        [
+            "stop_sequence",
+            "after_tools_end_turn",
+            "structured_output",
+            "invalid_then_valid_output",
+            "output_with_write",
+        ],
+    )
+    def test_normal_endings_are_graded(self, ending):
+        so = [("_Out", {"summary": "done"})]
+        turns = {
+            "stop_sequence": [_write(), _Stop("stop_sequence", "Done.")],
+            "after_tools_end_turn": [_write()],
+            "structured_output": [_write(), "Done.", so],
+            "invalid_then_valid_output": [_write(), "Done.", [("_Out", {"wrong": 1})], so],
+            "output_with_write": [_write() + so],
+        }[ending]
+        sandbox = _ScriptedSandbox([0])
+        agent = _harness(_ScriptedModel(turns), sandbox, verify="t")
+        if ending == "after_tools_end_turn":
+            agent.add_hook(lambda event: setattr(event, "end_turn", "Done."), AfterToolsEvent)
+
+        agent("make it", **({"structured_output_model": _Out} if "output" in ending else {}))
+
+        assert sandbox.commands == ["t"]
+        assert agent.state.get("verification")["status"] == "passed"
+        assert _outcome(agent) == (True, "satisfied", [True])
+
+    def test_read_only_structured_output_request_leaves_nothing_pending(self):
+        sandbox = _ScriptedSandbox([])
+        agent = _harness(_ScriptedModel(["Hi.", [("_Out", {"summary": "hi"})], "Just answering."]), sandbox, verify="t")
+
+        agent("say hi", structured_output_model=_Out)
+        agent("a question")
+
+        assert sandbox.commands == []
+        assert agent.state.get("verification") is None
+
+    @pytest.mark.parametrize("early", ["interrupt", "max_tokens"])
+    @pytest.mark.parametrize("before", ["nothing", "failed_check_then_write", "failed_check_no_write"])
+    def test_early_stop_is_pending_and_checked_next_time(self, early, before):
+        turns = {"nothing": [_write()], "failed_check_then_write": [_write(), "Done.", _write()]}.get(
+            before, [_write(), "Done."]
+        )
+        turns += [_read() if early == "interrupt" else _Stop("max_tokens"), "Fixed."]
+        checks_before = [] if before == "nothing" else ["t"]
+        sandbox = _ScriptedSandbox([1, 0] if checks_before else [0])
+        agent = _harness(_ScriptedModel(turns), sandbox, verify="t")
+        agent.add_hook(_gate_read, BeforeToolCallEvent)
+
+        if early == "max_tokens":
+            with pytest.raises(MaxTokensReachedException):
+                agent("make it")
+        else:
+            stopped = agent("make it")
+
+        assert sandbox.commands == checks_before
+        assert agent.state.get("verification")["status"] == "pending"
+        assert _outcome(agent) is None
+
+        result = _approve(agent, stopped) if early == "interrupt" else agent("go on")
+        assert str(result).strip() == "Fixed."
+        assert sandbox.commands == [*checks_before, "t"]
+        assert agent.state.get("verification") == {
+            "status": "passed",
+            "attempts": len(sandbox.commands),
+            "checks": [{"command": "t", "exit_code": 0}],
+        }
+        assert _outcome(agent) == (True, "satisfied", [False, True] if checks_before else [True])
+
+    def test_a_pass_followed_by_an_interrupted_change_is_pending_not_passed(self):
+        sandbox = _ScriptedSandbox([0])
+        agent = _harness(_ScriptedModel([_write(), "Done.", _write(), _read()]), sandbox, verify="t")
+        agent.add_hook(_gate_read, BeforeToolCallEvent)
+
+        agent("make it")
+        agent("change more")
+
+        assert sandbox.commands == ["t"]
+        assert agent.state.get("verification")["status"] == "pending"
+        assert _outcome(agent) is None
+
+    def test_a_turn_limit_after_a_failed_check_reports_only_what_the_last_check_said(self):
+        sandbox = _ScriptedSandbox([1, 0])
+        agent = _harness(_ScriptedModel([_write(), "Done.", _write(), _write(), "Fixed."]), sandbox, verify="t")
+
+        agent("make it", limits={"turns": 3})
+
+        # SDK versions differ on whether GoalLoop's retry may pass the limit; either way the outcome matches the
+        # last check, and "pending" goes with no result.
+        status = agent.state.get("verification")["status"]
+        if sandbox.commands == ["t"]:
+            assert (status, _outcome(agent)) in (("pending", None), ("failed", (False, "limit", [False])))
+        else:
+            assert (status, _outcome(agent)) == ("passed", (True, "satisfied", [False, True]))
+
+    def test_interrupts_do_not_reset_the_attempt_budget(self):
+        def gate_write(event):
+            if event.tool_use["name"] == "write":
+                event.interrupt("approve-write", reason="write?")
+
+        model = _ScriptedModel([_write(), "Done."] * 4)
+        sandbox = _ScriptedSandbox([1] * 4)
+        agent = _harness(model, sandbox, verify={"commands": ["t"], "max_attempts": 2})
+        agent.add_hook(gate_write, BeforeToolCallEvent)
+
+        result = agent("make it")
+        for _ in range(4):
+            if result.stop_reason != "interrupt":
+                break
+            result = _approve(agent, result)
+
+        assert result.stop_reason == "end_turn"
+        assert sandbox.commands == ["t", "t"]
+        headers = [p.split("\n")[1] for p in model.prompts if "<verification>" in p]
+        assert headers == ["The project's checks failed after your changes (attempt 1 of 2)."]
+        assert _outcome(agent) == (False, "max_attempts", [False, False])
+
+    def test_last_result_is_none_mid_invocation_and_kept_per_agent(self):
+        plugin = Verification(["t"])
+        seen = []
+        first = _harness(_ScriptedModel([]), _ScriptedSandbox([]), plugins=[plugin])
+        second = _harness(_ScriptedModel([_write(), "Done."]), _ScriptedSandbox([0]), plugins=[plugin])
+        second.add_hook(lambda event: seen.append(plugin.last_result(event.agent)), BeforeToolCallEvent)
+
+        second("make it")
+
+        assert seen == [None]
+        assert plugin.last_result(second).passed is True
+        assert plugin.last_result(first) is None
+
+    def test_validator_error_is_recorded_as_a_failure(self):
+        verify = {"commands": ["t"], "max_attempts": 1}
+        agent = _harness(_ScriptedModel([_write(), "Done."]), _ScriptedSandbox([]), verify=verify)
+
+        async def broken(_agent):
+            raise RuntimeError("sandbox is gone")
+
+        _plugin(agent)._resolve_commands = broken
+        agent("make it")
+
+        assert agent.state.get("verification")["checks"] == [{"command": "verify", "exit_code": -1}]
+        assert _outcome(agent) == (False, "max_attempts", [False])

@@ -246,9 +246,10 @@ def _verification_plugin(
     if config is None:
         return None
     if any(isinstance(p, GoalLoop) for p in consumer_plugins):
-        raise ValueError("verify cannot be combined with a GoalLoop in plugins: both drive the same resume.")
-    if any(isinstance(p, Verification) for p in consumer_plugins):
-        raise ValueError("verify is set and plugins already contains a Verification; pass one or the other.")
+        raise ValueError(
+            "verify cannot be combined with a GoalLoop in plugins (a Verification is one): verify builds a "
+            "GoalLoop, and an agent runs only one."
+        )
     if config["commands"] == "auto" and interventions:
         raise ValueError(
             "verify='auto' cannot be combined with interventions: detected commands run project-defined scripts "
@@ -412,13 +413,16 @@ def create_harness(
             command (``"pytest -q"``), a list run in order, ``"auto"`` to detect one from the project
             files (``package.json`` with a ``test`` script, ``pyproject.toml``, ``Cargo.toml``,
             ``go.mod``, a ``Makefile`` with a ``test`` target), or ``{"commands": ..., "max_attempts":
-            3, "timeout": 600}``. Checks run through the agent's ``sandbox``. When one exits non-zero, its
-            output goes back to the agent, which keeps working; after ``max_attempts`` failed checks it
-            gets one final turn to report what still fails. The outcome is written to
-            ``agent.state["verification"]``. A ``subagent`` child never verifies; the parent does.
-            ``"auto"`` runs project-defined scripts outside any approval gate, so it cannot be combined
-            with ``interventions``; name the commands explicitly instead. It cannot be combined with a
-            ``GoalLoop`` in ``plugins`` either, since both drive the same resume.
+            3, "timeout": 600}``. Sugar over ``GoalLoop``: it adds a ``Verification`` plugin, a GoalLoop
+            whose goal is the checks passing. Checks run through the agent's ``sandbox``. When one exits
+            non-zero, its output goes back to the agent, which keeps working; after ``max_attempts`` failed
+            check runs the loop stops and returns the agent's last answer, unverified, with a warning. An
+            invocation stopped early (interrupt, cancel, ``max_tokens``, limit) runs no checks; its changes are
+            ``"pending"`` until a later invocation ends normally, and ``max_attempts`` counts across such stops.
+            The outcome is written to ``agent.state["verification"]``. A ``subagent`` child never verifies;
+            the parent does. ``"auto"`` runs project-defined scripts outside any approval gate, so it cannot be
+            combined with ``interventions``; name the commands explicitly instead. It cannot be combined
+            with another ``GoalLoop`` in ``plugins`` either, since an agent runs only one.
     """
     setup_telemetry()
 
